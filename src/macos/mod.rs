@@ -59,6 +59,8 @@ fn argmax() -> usize {
 }
 
 pub(super) fn read_procargs2(pid: Pid) -> Result<Vec<u8>> {
+    // Read raw `KERN_PROCARGS2` for the target pid.
+    // This is shared by process-info building and env/argv enumeration to keep parsing consistent.
     let mut scratch = vec![0u8; argmax()];
 
     let mut mib: [c_int; 3] = [CTL_KERN, KERN_PROCARGS2, pid as _];
@@ -122,6 +124,8 @@ pub(super) fn parse_procargs2(data: &[u8]) -> Result<ProcArgs> {
         }
     }
 
+    // Parse the trailing NUL-separated `KEY=VALUE` block.
+    // Some macOS processes only expose argc/argv here (no env entries), which is a valid outcome.
     let mut environ = Vec::new();
     while idx < buf.len() {
         let start = idx;
@@ -227,6 +231,8 @@ impl Os for MacOs {
     }
 
     fn process_info_by_pid(&mut self, pid: Pid) -> Result<ProcessInfo> {
+        // We query BSD info with the target `pid`.
+        // Using the caller pid here breaks name-based filtering.
         let bsd_info =
             lp::proc_pid::pidinfo::<lp::bsd_info::BSDInfo>(pid as _, 0).map_err(|e| {
                 error!("bsd_info: {e}");
@@ -244,6 +250,7 @@ impl Os for MacOs {
                 .collect::<Vec<u8>>();
             let fallback_path = String::from_utf8_lossy(&fallback_path).into_owned();
 
+            // Prefer parsed procargs for executable path + argv, but always keep a safe fallback.
             match read_procargs2(pid).and_then(|d| parse_procargs2(&d)) {
                 Ok(parsed) => {
                     let path = if parsed.exec_path.is_empty() {

@@ -15,6 +15,9 @@ fn get_task(pid: u32) -> Result<mach_port_t> {
         let mut task = MACH_PORT_NULL;
         let res = task_for_pid(mach_task_self(), pid as i32, &mut task as *mut mach_port_t);
         if res != KERN_SUCCESS {
+            log::warn!(
+                "task_for_pid permission denied/unavailable for pid {pid} (kern_return={res})"
+            );
             Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown))
         } else {
             Ok(task)
@@ -44,6 +47,8 @@ impl ProcessVirtualMemory {
     }
 
     pub(crate) fn ensure_port(&mut self) -> Result<mach_port_t> {
+        // Acquire task port lazily so callers that only need process metadata can still work
+        // when task_for_pid is restricted.
         if self.port == MACH_PORT_NULL {
             self.port = get_task(self.pid)?;
         }
