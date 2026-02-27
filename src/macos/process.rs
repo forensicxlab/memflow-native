@@ -118,10 +118,10 @@ impl Clone for MacProcess {
 impl MacProcess {
     pub fn try_new(info: ProcessInfo) -> Result<Self> {
         Ok(Self {
-            virt_mem: ProcessVirtualMemory::try_new(&info).map_err(|e| {
-                log::error!("Unable to get port");
-                e
-            })?,
+            virt_mem: ProcessVirtualMemory::try_new(&info).unwrap_or_else(|e| {
+                log::warn!("Unable to get task port for pid {}: {e:?}", info.pid);
+                ProcessVirtualMemory::new_unavailable(info.pid)
+            }),
             info,
             cached_maps: vec![],
             cached_module_maps: vec![],
@@ -135,9 +135,10 @@ impl MacProcess {
 
         let mut count =
             (core::mem::size_of::<task_dyld_info>() / core::mem::size_of::<natural_t>()) as _;
+        let port = self.virt_mem.ensure_port()?;
         let ret = unsafe {
             task_info(
-                self.virt_mem.port,
+                port,
                 TASK_DYLD_INFO,
                 &mut info as *mut task_dyld_info as *mut _,
                 &mut count,
@@ -177,7 +178,7 @@ impl MacProcess {
             // And now, let's process the elements
             for i in &info_buf[..size] {
                 // TODO: do the string reads concurrently
-                let name = self.read_char_string(i.image_file_path.into())?;
+                let name = self.read_utf8_lossy(i.image_file_path.into(), 4096)?;
 
                 let start = Address::from(i.image_load_address);
                 let mut end = start;
@@ -204,7 +205,7 @@ impl MacProcess {
                         break;
                     }
                     if ret < size {
-                        panic!("Invalid size returned from proc_pidinfo ({ret} vs {size})");
+                        return Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown));
                     }
 
                     let ino = prwpi.prp_vip.vip_vi.vi_stat.vst_ino;
@@ -304,7 +305,7 @@ impl MacProcess {
         Ok(())
     }
 
-    pub fn update_cached_maps(&mut self, mut start: Address, end: Address) {
+    pub fn update_cached_maps(&mut self, mut start: Address, end: Address) -> Result<()> {
         let mut pri: proc_regioninfo = unsafe { MaybeUninit::zeroed().assume_init() };
         let mut last_pri: proc_regioninfo = unsafe { MaybeUninit::zeroed().assume_init() };
 
@@ -326,7 +327,7 @@ impl MacProcess {
                 break;
             }
             if ret < size {
-                panic!("Invalid size returned from proc_pidinfo ({ret} vs {size})");
+                return Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown));
             }
 
             start = Address::from(pri.pri_address);
@@ -382,6 +383,7 @@ impl MacProcess {
         }
 
         self.cached_maps.sort_by_key(|v| v.0);
+        Ok(())
     }
 }
 
@@ -406,7 +408,7 @@ impl Process for MacProcess {
         self.cached_module_maps
             .iter()
             .enumerate()
-            .filter(|_| target_arch.is_none() || Some(&self.info().sys_arch) == target_arch)
+            .filter(|_| target_arch.is_none() || Some(&self.info().proc_arch) == target_arch)
             .take_while(|(i, _)| {
                 callback.call(ModuleAddressInfo {
                     address: Address::from(*i as u64),
@@ -428,7 +430,7 @@ impl Process for MacProcess {
         address: Address,
         architecture: ArchitectureIdent,
     ) -> Result<ModuleInfo> {
-        if architecture != self.info.sys_arch {
+        if architecture != self.info.proc_arch {
             return Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound));
         }
 
@@ -453,7 +455,7 @@ impl Process for MacProcess {
                         .unwrap_or(path)
                         .into(),
                     path: path.into(),
-                    arch: self.info.sys_arch,
+                    arch: self.info.proc_arch,
                 }
             })
             .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
@@ -514,7 +516,9 @@ impl Process for MacProcess {
         end: Address,
         out: MemoryRangeCallback,
     ) {
-        self.update_cached_maps(start, end);
+        if self.update_cached_maps(start, end).is_err() {
+            return;
+        }
 
         self.cached_maps
             .iter()
@@ -530,7 +534,7 @@ impl Process for MacProcess {
             })
             .map(|(s, sz, perms)| {
                 if s + sz > end {
-                    let diff = s - end;
+                    let diff = s + sz - end;
                     (s, sz - diff as umem, perms)
                 } else {
                     (s, sz, perms)
@@ -545,6 +549,53 @@ impl Process for MacProcess {
             })
             .map(<_>::into)
             .feed_into(out);
+    }
+
+    fn envar_list_callback(
+        &mut self,
+        target_arch: Option<&ArchitectureIdent>,
+        mut callback: EnvVarCallback,
+    ) -> Result<()> {
+        if let Some(arch) = target_arch {
+            if *arch != self.info.proc_arch {
+                return Ok(());
+            }
+        }
+
+        let parsed =
+            super::read_procargs2(self.info.pid).and_then(|data| super::parse_procargs2(&data))?;
+
+        for (name, value) in parsed.environ {
+            let info = EnvVarInfo {
+                name: name.into(),
+                value: value.into(),
+                address: memflow::types::Address::from(0),
+                arch: self.info.proc_arch,
+            };
+
+            if !callback.call(info) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn environment_block_address(&mut self, _architecture: ArchitectureIdent) -> Result<Address> {
+        // macOS does not expose a stable public env-block pointer like Windows.
+        // Return a sentinel and enumerate via sysctl in `envar_list_from_address`.
+        Ok(Address::NULL)
+    }
+
+    fn envar_list_from_address(
+        &mut self,
+        _env_block: Address,
+        architecture: ArchitectureIdent,
+        callback: EnvVarCallback,
+    ) -> Result<()> {
+        // Same rationale as Linux: we can’t use env_block directly, but we *can*
+        // enumerate via sysctl.
+        self.envar_list_callback(Some(&architecture), callback)
     }
 }
 

@@ -4,8 +4,8 @@ use memflow::prelude::v1::*;
 use memflow::types::gap_remover::GapRemover;
 
 use super::{conv_err, ProcessVirtualMemory};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
-use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, STILL_ACTIVE};
 
 use windows::Win32::System::Memory::{
@@ -19,10 +19,7 @@ use windows::Win32::System::ProcessStatus::{
     LIST_MODULES_64BIT,
 };
 
-use windows::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
-
-use core::mem::{size_of, size_of_val};
-use core::ptr;
+use core::mem::size_of;
 
 #[derive(Clone)]
 pub struct WindowsProcess {
@@ -41,6 +38,41 @@ impl WindowsProcess {
             cached_modules: vec![],
         })
     }
+
+    fn process_exists(&self) -> bool {
+        let pid = Pid::from_u32(self.info.pid);
+        let mut system = System::new_with_specifics(
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+        );
+        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        system.process(pid).is_some()
+    }
+
+    fn collect_envars(&self) -> Result<Vec<EnvVarInfo>> {
+        let pid = Pid::from_u32(self.info.pid);
+        let mut system = System::new_with_specifics(
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+        );
+        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        let proc = system
+            .process(pid)
+            .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::EnvarNotFound))?;
+
+        let mut out = Vec::new();
+        for entry in proc.environ() {
+            let s = entry.to_string_lossy().into_owned();
+            if let Some((name, value)) = s.split_once('=') {
+                out.push(EnvVarInfo {
+                    name: ReprCString::from(name),
+                    value: ReprCString::from(value),
+                    address: Address::NULL,
+                    arch: self.info.proc_arch,
+                });
+            }
+        }
+
+        Ok(out)
+    }
 }
 
 cglue_impl_group!(WindowsProcess, ProcessInstance, {});
@@ -49,27 +81,10 @@ cglue_impl_group!(WindowsProcess, IntoProcessInstance, {});
 impl Process for WindowsProcess {
     /// Retrieves the state of the process
     fn state(&mut self) -> ProcessState {
-        let mut info = PROCESS_BASIC_INFORMATION::default();
-
-        if unsafe {
-            NtQueryInformationProcess(
-                **self.virt_mem.handle,
-                ProcessBasicInformation,
-                &mut info as *mut _ as _,
-                size_of_val(&info) as _,
-                ptr::null_mut(),
-            )
-        }
-        .ok()
-        .is_err()
-        {
-            return ProcessState::Unknown;
-        }
-
-        if info.ExitStatus == STILL_ACTIVE {
+        if self.process_exists() {
             ProcessState::Alive
         } else {
-            ProcessState::Dead(info.ExitStatus.0)
+            ProcessState::Dead(STILL_ACTIVE.0)
         }
     }
 
@@ -203,23 +218,13 @@ impl Process for WindowsProcess {
     ///
     /// This will generally be for the initial executable that was run
     fn primary_module_address(&mut self) -> Result<Address> {
-        let mut info = PROCESS_BASIC_INFORMATION::default();
-
-        unsafe {
-            NtQueryInformationProcess(
-                **self.virt_mem.handle,
-                ProcessBasicInformation,
-                &mut info as *mut _ as _,
-                size_of_val(&info) as _,
-                ptr::null_mut(),
-            )
-        }
-        .ok()
-        .map_err(conv_err)?;
-
-        // 0x10 is the offset of the `ImageBaseAddress` field in the `PEB64` structure
-        self.read_addr64(Address::from(info.PebBaseAddress as umem + 0x10))
-            .data_part()
+        let proc_arch = self.info.proc_arch;
+        self.module_list_arch(Some(&proc_arch))
+            .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))?
+            .into_iter()
+            .next()
+            .map(|m| m.base)
+            .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
     }
 
     fn module_import_list_callback(
@@ -244,6 +249,49 @@ impl Process for WindowsProcess {
         callback: SectionCallback,
     ) -> Result<()> {
         memflow::os::util::module_section_list_callback(&mut self.virt_mem, info, callback)
+    }
+
+    fn envar_list_callback(
+        &mut self,
+        target_arch: Option<&ArchitectureIdent>,
+        mut callback: EnvVarCallback,
+    ) -> Result<()> {
+        if let Some(target_arch) = target_arch {
+            if *target_arch != self.info.proc_arch {
+                return Ok(());
+            }
+        }
+
+        for ev in self.collect_envars()? {
+            if !callback.call(ev) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn environment_block_address(&mut self, _architecture: ArchitectureIdent) -> Result<Address> {
+        Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotSupported))
+    }
+
+    fn envar_list_from_address(
+        &mut self,
+        _env_block: Address,
+        architecture: ArchitectureIdent,
+        mut callback: EnvVarCallback,
+    ) -> Result<()> {
+        if architecture != self.info.proc_arch {
+            return Ok(());
+        }
+
+        for ev in self.collect_envars()? {
+            if !callback.call(ev) {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     /// Retrieves the process info

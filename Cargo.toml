@@ -21,6 +21,7 @@ itertools = "0.14"
 libc = { version = "0.2" }
 log = "0.4"
 memflow = { version = "0.2", features = ["plugins", "goblin"] }
+#memflow = { path = "../memflow/memflow" }
 
 # we keep procfs on version 0.15.x because it does not build properly with the backtrace on 0.16.x
 # tracking issue: https://github.com/eminence/procfs/pull/309
@@ -42,6 +43,7 @@ windows = { version = "0.61", features = [
 	"Win32_UI_Input",
 	"Win32_UI_Input_KeyboardAndMouse",
 ] }
+sysinfo = "0.37"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-sys-info = "0.1"

@@ -15,7 +15,6 @@ fn get_task(pid: u32) -> Result<mach_port_t> {
         let mut task = MACH_PORT_NULL;
         let res = task_for_pid(mach_task_self(), pid as i32, &mut task as *mut mach_port_t);
         if res != KERN_SUCCESS {
-            log::error!("Could not get task: {res}");
             Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown))
         } else {
             Ok(task)
@@ -35,6 +34,21 @@ impl ProcessVirtualMemory {
             port: get_task(info.pid)?,
             pid: info.pid,
         })
+    }
+
+    pub fn new_unavailable(pid: u32) -> Self {
+        Self {
+            port: MACH_PORT_NULL,
+            pid,
+        }
+    }
+
+    pub(crate) fn ensure_port(&mut self) -> Result<mach_port_t> {
+        if self.port == MACH_PORT_NULL {
+            self.port = get_task(self.pid)?;
+        }
+
+        Ok(self.port)
     }
 }
 
@@ -67,6 +81,8 @@ impl<'a> RWSlice for CSliceRef<'a, u8> {
 
         for off in iter {
             let size = core::cmp::min(size - off, u32::MAX as _);
+            let local = (local as usize + off) as *const c_void;
+            let remote = (remote as usize + off) as *const c_void;
 
             let ret = mach_vm_write(port, remote as _, local as _, size as u32);
 
@@ -95,11 +111,12 @@ impl<'a> RWSlice for CSliceMut<'a, u8> {
         // mach_vm_read_list exists, however, it seems to allocate new buffers, meaning, we would
         // need to perform a second copy, and free those buffers immediately afterwards (1 syscall
         // per buffer!). Therefore, we are doing sequential read syscall per buffer.
-        let ret = mach_vm_read_overwrite(port, remote as _, size as _, local as _, &mut 0);
+        let mut out_size = 0;
+        let ret = mach_vm_read_overwrite(port, remote as _, size as _, local as _, &mut out_size);
         if ret != KERN_SUCCESS {
             return Err(Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadMemory));
         }
-        Ok(size)
+        Ok(out_size as usize)
     }
 }
 
@@ -113,9 +130,11 @@ impl ProcessVirtualMemory {
             mut out_fail,
         }: MemOps<CTup3<Address, Address, T>, CTup2<Address, T>>,
     ) -> Result<()> {
+        let port = self.ensure_port()?;
+
         for CTup3(addr, meta_addr, buf) in inp {
             let written =
-                unsafe { T::do_rw(self.port, buf.as_ptr() as _, addr.to_umem() as _, buf.len()) }
+                unsafe { T::do_rw(port, buf.as_ptr() as _, addr.to_umem() as _, buf.len()) }
                     .unwrap_or(0);
 
             let (succeed, fail) = buf.split_at(written as _);
