@@ -1,7 +1,7 @@
 [package]
 name = "memflow-native"
 version = "0.2.6"
-authors = ["Aurimas Blažulionis <0x60@pm.me>", "ko1N <ko1N1337@gmail.com>"]
+authors = ["Aurimas Blažulionis <0x60@pm.me>", "ko1N <ko1N1337@gmail.com>", "k1nd0ne <k1nd0ne@mail.com>"]
 edition = "2021"
 description = "System call based proxy-OS for memflow"
 documentation = "https://docs.rs/memflow-native"
