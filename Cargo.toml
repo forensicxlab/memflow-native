@@ -20,8 +20,7 @@ goblin = "0.9"
 itertools = "0.14"
 libc = { version = "0.2" }
 log = "0.4"
-memflow = { version = "0.2", features = ["plugins", "goblin"] }
-#memflow = { path = "../memflow/memflow" }
+memflow = { git = "https://github.com/forensicxlab/memflow", branch = "main", features = ["plugins", "goblin"] }
 
 # we keep procfs on version 0.15.x because it does not build properly with the backtrace on 0.16.x
 # tracking issue: https://github.com/eminence/procfs/pull/309
