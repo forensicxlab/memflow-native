@@ -19,7 +19,12 @@ pub struct ProcessVirtualMemory {
 
 impl ProcessVirtualMemory {
     pub fn new(info: &ProcessInfo) -> Self {
-        let iov_max = unsafe { sysconf(_SC_IOV_MAX) } as usize;
+        const DEFAULT_IOV_MAX: usize = 1024;
+
+        let iov_max = usize::try_from(unsafe { sysconf(_SC_IOV_MAX) })
+            .ok()
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_IOV_MAX);
 
         Self {
             pid: info.pid as pid_t,
