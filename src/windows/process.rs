@@ -6,8 +6,10 @@ use memflow::types::gap_remover::GapRemover;
 use super::{conv_err, conv_ntstatus};
 use crate::windows::mem::ProcessVirtualMemory;
 
-use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
-use windows::Win32::Foundation::{HINSTANCE, HMODULE, STILL_ACTIVE};
+use windows::Wdk::System::Threading::{
+    NtQueryInformationProcess, ProcessBasicInformation, ProcessWow64Information,
+};
+use windows::Win32::Foundation::{HINSTANCE, HMODULE, STATUS_INVALID_INFO_CLASS, STILL_ACTIVE};
 
 use windows::Win32::System::Memory::{
     VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_FREE, MEM_RESERVE, PAGE_EXECUTE,
@@ -220,9 +222,33 @@ impl Process for WindowsProcess {
             return Err(conv_ntstatus(status));
         }
 
-        // 0x10 is the offset of the `ImageBaseAddress` field in the `PEB64` structure
-        self.read_addr64(Address::from(info.PebBaseAddress as umem + 0x10))
-            .data_part()
+        let mut wow64_peb = 0usize;
+        let wow64_status = unsafe {
+            NtQueryInformationProcess(
+                **self.virt_mem.handle,
+                ProcessWow64Information,
+                &mut wow64_peb as *mut _ as _,
+                size_of_val(&wow64_peb) as _,
+                ptr::null_mut(),
+            )
+        };
+
+        if wow64_status.is_err() && wow64_status != STATUS_INVALID_INFO_CLASS {
+            return Err(conv_ntstatus(wow64_status));
+        }
+
+        if wow64_peb != 0 {
+            return self
+                .read_addr32(Address::from(wow64_peb as umem + 0x8))
+                .data_part();
+        }
+
+        let peb = Address::from(info.PebBaseAddress as umem);
+        match self.info.proc_arch.into_obj().bits() {
+            64 => self.read_addr64(peb + 0x10).data_part(),
+            32 => self.read_addr32(peb + 0x8).data_part(),
+            _ => Err(Error(ErrorOrigin::OsLayer, ErrorKind::InvalidArchitecture)),
+        }
     }
 
     fn module_import_list_callback(
