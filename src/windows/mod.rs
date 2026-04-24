@@ -2,7 +2,11 @@ use memflow::os::process::*;
 use memflow::prelude::v1::*;
 
 use windows::core::PCSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_INSUFFICIENT_RESOURCES,
+    STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
+    STATUS_NOT_IMPLEMENTED, STATUS_NO_MEMORY, STATUS_PRIVILEGE_NOT_HELD,
+};
 
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -57,6 +61,19 @@ pub fn conv_err(_err: windows::core::Error) -> Error {
     // TODO: proper error kind
     // TODO: proper origin
     Error(ErrorOrigin::OsLayer, ErrorKind::Unknown)
+}
+
+pub(crate) fn conv_ntstatus(status: NTSTATUS) -> Error {
+    let kind = match status {
+        STATUS_ACCESS_DENIED | STATUS_PRIVILEGE_NOT_HELD => ErrorKind::Permissions,
+        STATUS_INVALID_PARAMETER => ErrorKind::ArgValidation,
+        STATUS_NOT_IMPLEMENTED | STATUS_INVALID_INFO_CLASS => ErrorKind::NotSupported,
+        STATUS_INSUFFICIENT_RESOURCES | STATUS_NO_MEMORY => ErrorKind::OutOfMemory,
+        STATUS_INVALID_HANDLE => ErrorKind::ProcessNotFound,
+        _ => ErrorKind::Unknown,
+    };
+
+    Error(ErrorOrigin::OsLayer, kind)
 }
 
 unsafe fn enable_debug_privilege() -> Result<()> {

@@ -3,7 +3,7 @@ use memflow::os::process::*;
 use memflow::prelude::v1::*;
 use memflow::types::gap_remover::GapRemover;
 
-use super::{conv_err, ProcessVirtualMemory};
+use super::{conv_err, conv_ntstatus, ProcessVirtualMemory};
 
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, STILL_ACTIVE};
@@ -51,7 +51,7 @@ impl Process for WindowsProcess {
     fn state(&mut self) -> ProcessState {
         let mut info = PROCESS_BASIC_INFORMATION::default();
 
-        if unsafe {
+        let status = unsafe {
             NtQueryInformationProcess(
                 **self.virt_mem.handle,
                 ProcessBasicInformation,
@@ -59,10 +59,10 @@ impl Process for WindowsProcess {
                 size_of_val(&info) as _,
                 ptr::null_mut(),
             )
-        }
-        .ok()
-        .is_err()
-        {
+        };
+
+        if status.is_err() {
+            let _mapped = conv_ntstatus(status);
             return ProcessState::Unknown;
         }
 
@@ -205,7 +205,7 @@ impl Process for WindowsProcess {
     fn primary_module_address(&mut self) -> Result<Address> {
         let mut info = PROCESS_BASIC_INFORMATION::default();
 
-        unsafe {
+        let status = unsafe {
             NtQueryInformationProcess(
                 **self.virt_mem.handle,
                 ProcessBasicInformation,
@@ -213,9 +213,11 @@ impl Process for WindowsProcess {
                 size_of_val(&info) as _,
                 ptr::null_mut(),
             )
+        };
+
+        if status.is_err() {
+            return Err(conv_ntstatus(status));
         }
-        .ok()
-        .map_err(conv_err)?;
 
         // 0x10 is the offset of the `ImageBaseAddress` field in the `PEB64` structure
         self.read_addr64(Address::from(info.PebBaseAddress as umem + 0x10))
