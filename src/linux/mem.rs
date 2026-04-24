@@ -8,6 +8,8 @@ use std::ffi::c_void;
 #[repr(transparent)]
 struct IoSendVec(iovec);
 
+// Safety: IoSendVec stores transient iovec pointers that are only constructed and
+// consumed within &mut self operations; no cross-thread aliasing is exposed.
 unsafe impl Send for IoSendVec {}
 
 #[derive(Clone)]
@@ -122,7 +124,13 @@ impl ProcessVirtualMemory {
         let mut elem = inp.next();
 
         'exit: while let Some(CTup3(a, m, b)) = elem {
-            let (cnt, (liov, (riov, meta))) = iov_next.unwrap();
+            let Some((cnt, (liov, (riov, meta)))) = iov_next else {
+                debug_assert!(
+                    false,
+                    "iov_next must exist while current input element is present"
+                );
+                break;
+            };
 
             let iov_len = b.len();
 
