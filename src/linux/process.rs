@@ -260,7 +260,7 @@ impl Process for LinuxProcess {
                 })
                 .map(|(s, sz, perms)| {
                     if s + sz > end {
-                        let diff = s - end;
+                        let diff = (s + sz) - end;
                         (s, sz - diff as umem, perms)
                     } else {
                         (s, sz, perms)
