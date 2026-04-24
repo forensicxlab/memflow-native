@@ -3,7 +3,8 @@ use memflow::os::process::*;
 use memflow::prelude::v1::*;
 use memflow::types::gap_remover::GapRemover;
 
-use super::{conv_err, conv_ntstatus, ProcessVirtualMemory};
+use super::{conv_err, conv_ntstatus};
+use crate::windows::mem::ProcessVirtualMemory;
 
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, STILL_ACTIVE};
