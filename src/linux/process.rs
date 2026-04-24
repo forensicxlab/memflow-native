@@ -12,7 +12,7 @@ use itertools::Itertools;
 
 pub struct LinuxProcess {
     virt_mem: ProcessVirtualMemory,
-    proc: procfs::process::Process,
+    pid: pid_t,
     info: ProcessInfo,
     cached_maps: Vec<procfs::process::MemoryMap>,
     cached_module_maps: Vec<procfs::process::MemoryMap>,
@@ -22,7 +22,7 @@ impl Clone for LinuxProcess {
     fn clone(&self) -> Self {
         Self {
             virt_mem: self.virt_mem.clone(),
-            proc: procfs::process::Process::new(self.proc.pid()).unwrap(),
+            pid: self.pid,
             info: self.info.clone(),
             cached_maps: self.cached_maps.clone(),
             cached_module_maps: self.cached_module_maps.clone(),
@@ -31,11 +31,15 @@ impl Clone for LinuxProcess {
 }
 
 impl LinuxProcess {
+    fn proc_handle(&self) -> Result<procfs::process::Process> {
+        procfs::process::Process::new(self.pid)
+            .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))
+    }
+
     pub fn try_new(info: ProcessInfo) -> Result<Self> {
         Ok(Self {
             virt_mem: ProcessVirtualMemory::new(&info),
-            proc: procfs::process::Process::new(info.pid as pid_t)
-                .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))?,
+            pid: info.pid as pid_t,
             info,
             cached_maps: vec![],
             cached_module_maps: vec![],
@@ -96,7 +100,7 @@ impl Process for LinuxProcess {
         mut callback: ModuleAddressCallback,
     ) -> Result<()> {
         self.cached_maps = self
-            .proc
+            .proc_handle()?
             .maps()
             .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))?
             .memory_maps;
@@ -228,53 +232,54 @@ impl Process for LinuxProcess {
         end: Address,
         out: MemoryRangeCallback,
     ) {
-        if let Ok(maps) = self
-            .proc
-            .maps()
-            .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))
-        {
-            self.cached_maps = maps.memory_maps;
+        if let Ok(proc) = self.proc_handle() {
+            if let Ok(maps) = proc
+                .maps()
+                .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))
+            {
+                self.cached_maps = maps.memory_maps;
 
-            self.cached_maps
-                .iter()
-                .filter(|map| {
-                    Address::from(map.address.1) > start && Address::from(map.address.0) < end
-                })
-                .filter(|m| m.perms.contains(MMPermissions::READ))
-                .map(|map| {
-                    (
-                        Address::from(map.address.0),
-                        (map.address.1 - map.address.0) as umem,
-                        PageType::empty()
-                            .noexec(!map.perms.contains(MMPermissions::EXECUTE))
-                            .write(map.perms.contains(MMPermissions::WRITE)),
-                    )
-                })
-                .map(|(s, sz, perms)| {
-                    if s < start {
-                        let diff = start - s;
-                        (start, sz - diff as umem, perms)
-                    } else {
-                        (s, sz, perms)
-                    }
-                })
-                .map(|(s, sz, perms)| {
-                    if s + sz > end {
-                        let diff = (s + sz) - end;
-                        (s, sz - diff as umem, perms)
-                    } else {
-                        (s, sz, perms)
-                    }
-                })
-                .coalesce(|a, b| {
-                    if gap_size >= 0 && a.0 + a.1 + gap_size as umem >= b.0 && a.2 == b.2 {
-                        Ok((a.0, (b.0 - a.0) as umem + b.1, a.2))
-                    } else {
-                        Err((a, b))
-                    }
-                })
-                .map(<_>::into)
-                .feed_into(out);
+                self.cached_maps
+                    .iter()
+                    .filter(|map| {
+                        Address::from(map.address.1) > start && Address::from(map.address.0) < end
+                    })
+                    .filter(|m| m.perms.contains(MMPermissions::READ))
+                    .map(|map| {
+                        (
+                            Address::from(map.address.0),
+                            (map.address.1 - map.address.0) as umem,
+                            PageType::empty()
+                                .noexec(!map.perms.contains(MMPermissions::EXECUTE))
+                                .write(map.perms.contains(MMPermissions::WRITE)),
+                        )
+                    })
+                    .map(|(s, sz, perms)| {
+                        if s < start {
+                            let diff = start - s;
+                            (start, sz - diff as umem, perms)
+                        } else {
+                            (s, sz, perms)
+                        }
+                    })
+                    .map(|(s, sz, perms)| {
+                        if s + sz > end {
+                            let diff = (s + sz) - end;
+                            (s, sz - diff as umem, perms)
+                        } else {
+                            (s, sz, perms)
+                        }
+                    })
+                    .coalesce(|a, b| {
+                        if gap_size >= 0 && a.0 + a.1 + gap_size as umem >= b.0 && a.2 == b.2 {
+                            Ok((a.0, (b.0 - a.0) as umem + b.1, a.2))
+                        } else {
+                            Err((a, b))
+                        }
+                    })
+                    .map(<_>::into)
+                    .feed_into(out);
+            }
         }
     }
 }
