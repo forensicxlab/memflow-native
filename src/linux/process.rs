@@ -14,8 +14,6 @@ pub struct LinuxProcess {
     virt_mem: ProcessVirtualMemory,
     pid: pid_t,
     info: ProcessInfo,
-    cached_maps: Vec<procfs::process::MemoryMap>,
-    cached_module_maps: Vec<procfs::process::MemoryMap>,
 }
 
 impl Clone for LinuxProcess {
@@ -24,8 +22,6 @@ impl Clone for LinuxProcess {
             virt_mem: self.virt_mem.clone(),
             pid: self.pid,
             info: self.info.clone(),
-            cached_maps: self.cached_maps.clone(),
-            cached_module_maps: self.cached_module_maps.clone(),
         }
     }
 }
@@ -36,13 +32,44 @@ impl LinuxProcess {
             .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))
     }
 
+    fn module_maps(&self) -> Result<Vec<procfs::process::MemoryMap>> {
+        let maps = self
+            .proc_handle()?
+            .maps()
+            .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))?
+            .memory_maps;
+
+        Ok(maps
+            .into_iter()
+            .filter(|map| matches!(map.pathname, MMapPath::Path(_)))
+            .coalesce(|m1, m2| {
+                if m1.address.1 == m2.address.0
+                    // When the file gets mapped in memory, offsets change.
+                    // && m2.offset - m1.offset == m1.address.1 - m1.address.0
+                    && m1.dev == m2.dev
+                    && m1.inode == m2.inode
+                {
+                    Ok(procfs::process::MemoryMap {
+                        address: (m1.address.0, m2.address.1),
+                        perms: MMPermissions::NONE,
+                        offset: m1.offset,
+                        dev: m1.dev,
+                        inode: m1.inode,
+                        pathname: m1.pathname,
+                        extension: MMapExtension::default(),
+                    })
+                } else {
+                    Err((m1, m2))
+                }
+            })
+            .collect())
+    }
+
     pub fn try_new(info: ProcessInfo) -> Result<Self> {
         Ok(Self {
             virt_mem: ProcessVirtualMemory::new(&info),
             pid: info.pid as pid_t,
             info,
-            cached_maps: vec![],
-            cached_module_maps: vec![],
         })
     }
 
@@ -99,40 +126,9 @@ impl Process for LinuxProcess {
         target_arch: Option<&ArchitectureIdent>,
         mut callback: ModuleAddressCallback,
     ) -> Result<()> {
-        self.cached_maps = self
-            .proc_handle()?
-            .maps()
-            .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))?
-            .memory_maps;
+        let module_maps = self.module_maps()?;
 
-        self.cached_module_maps = self
-            .cached_maps
-            .iter()
-            .filter(|map| matches!(map.pathname, MMapPath::Path(_)))
-            .cloned()
-            .coalesce(|m1, m2| {
-                if m1.address.1 == m2.address.0
-                    // When the file gets mapped in memory, offsets change.
-                    // && m2.offset - m1.offset == m1.address.1 - m1.address.0
-                    && m1.dev == m2.dev
-                    && m1.inode == m2.inode
-                {
-                    Ok(procfs::process::MemoryMap {
-                        address: (m1.address.0, m2.address.1),
-                        perms: MMPermissions::NONE,
-                        offset: m1.offset,
-                        dev: m1.dev,
-                        inode: m1.inode,
-                        pathname: m1.pathname,
-                        extension: MMapExtension::default(),
-                    })
-                } else {
-                    Err((m1, m2))
-                }
-            })
-            .collect();
-
-        self.cached_module_maps
+        module_maps
             .iter()
             .enumerate()
             .filter(|_| target_arch.is_none() || Some(&self.info().sys_arch) == target_arch)
@@ -161,9 +157,9 @@ impl Process for LinuxProcess {
             return Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound));
         }
 
-        // TODO: create cached_module_maps if its empty
+        let module_maps = self.module_maps()?;
 
-        self.cached_module_maps
+        module_maps
             .get(address.to_umem() as usize)
             .map(|map| ModuleInfo {
                 address,
@@ -237,10 +233,8 @@ impl Process for LinuxProcess {
                 .maps()
                 .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))
             {
-                self.cached_maps = maps.memory_maps;
-
-                self.cached_maps
-                    .iter()
+                maps.memory_maps
+                    .into_iter()
                     .filter(|map| {
                         Address::from(map.address.1) > start && Address::from(map.address.0) < end
                     })
