@@ -1,12 +1,15 @@
 use memflow::os::process::*;
 use memflow::prelude::v1::*;
 
-use windows::core::PCSTR;
+use windows::core::{HRESULT, PCSTR};
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_INFO_LENGTH_MISMATCH,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS,
-    STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED, STATUS_NO_MEMORY, STATUS_PRIVILEGE_NOT_HELD,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_INVALID_ADDRESS, ERROR_INVALID_FLAGS, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
+    ERROR_NOACCESS, ERROR_NOT_FOUND, ERROR_PARTIAL_COPY, ERROR_PRIVILEGE_NOT_HELD, HANDLE,
+    NTSTATUS, STATUS_ACCESS_DENIED, STATUS_INFO_LENGTH_MISMATCH, STATUS_INSUFFICIENT_RESOURCES,
+    STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
+    STATUS_NOT_IMPLEMENTED, STATUS_NO_MEMORY, STATUS_PRIVILEGE_NOT_HELD,
 };
 
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -79,10 +82,32 @@ impl Drop for Handle {
     }
 }
 
-pub fn conv_err(_err: windows::core::Error) -> Error {
-    // TODO: proper error kind
-    // TODO: proper origin
-    Error(ErrorOrigin::OsLayer, ErrorKind::Unknown)
+pub fn conv_err(err: windows::core::Error) -> Error {
+    let kind = match err.code() {
+        c if c == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0)
+            || c == HRESULT::from_win32(ERROR_INVALID_FLAGS.0)
+            || c == HRESULT::from_win32(ERROR_BAD_LENGTH.0)
+            || c == HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) =>
+        {
+            ErrorKind::ArgValidation
+        }
+        c if c == HRESULT::from_win32(ERROR_ACCESS_DENIED.0)
+            || c == HRESULT::from_win32(ERROR_PRIVILEGE_NOT_HELD.0) =>
+        {
+            ErrorKind::NotSupported
+        }
+        c if c == HRESULT::from_win32(ERROR_INVALID_HANDLE.0) => ErrorKind::ProcessNotFound,
+        c if c == HRESULT::from_win32(ERROR_NOT_FOUND.0) => ErrorKind::NotFound,
+        c if c == HRESULT::from_win32(ERROR_NOACCESS.0)
+            || c == HRESULT::from_win32(ERROR_INVALID_ADDRESS.0)
+            || c == HRESULT::from_win32(ERROR_PARTIAL_COPY.0) =>
+        {
+            ErrorKind::UnableToReadMemory
+        }
+        _ => ErrorKind::Unknown,
+    };
+
+    Error(ErrorOrigin::OsLayer, kind)
 }
 
 pub(crate) fn conv_ntstatus(status: NTSTATUS) -> Error {
