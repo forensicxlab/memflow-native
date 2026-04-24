@@ -20,8 +20,7 @@ use windows::Win32::Security::{
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
 };
 
-use core::mem::{align_of, size_of, MaybeUninit};
-use core::ptr;
+use core::mem::{align_of, size_of};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 
@@ -170,8 +169,6 @@ unsafe fn enable_debug_privilege() -> Result<()> {
 
 pub struct WindowsOs {
     info: OsInfo,
-    cached_processes: Vec<ProcessInfo>,
-    cached_modules: Vec<KernelModule>,
 }
 
 impl WindowsOs {
@@ -270,8 +267,6 @@ impl Clone for WindowsOs {
     fn clone(&self) -> Self {
         Self {
             info: self.info.clone(),
-            cached_processes: vec![],
-            cached_modules: vec![],
         }
     }
 }
@@ -284,11 +279,7 @@ impl Default for WindowsOs {
             arch: ArchitectureIdent::X86(64, false),
         };
 
-        Self {
-            info,
-            cached_modules: vec![],
-            cached_processes: vec![],
-        }
+        Self { info }
     }
 }
 
@@ -299,39 +290,55 @@ impl Os for WindowsOs {
     /// Walks a process list and calls a callback for each process structure address
     ///
     /// The callback is fully opaque. We need this style so that C FFI can work seamlessly.
-    fn process_address_list_callback(&mut self, callback: AddressCallback) -> Result<()> {
+    fn process_address_list_callback(&mut self, mut callback: AddressCallback) -> Result<()> {
         let handle =
             Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(conv_err)?);
 
-        let mut maybe_entry = MaybeUninit::<PROCESSENTRY32W>::uninit();
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
 
-        unsafe {
-            ptr::write(
-                &mut (*maybe_entry.as_mut_ptr()).dwSize,
-                size_of::<PROCESSENTRY32W>() as u32,
-            );
+        if unsafe { Process32FirstW(*handle, &mut entry) }.is_err() {
+            return Ok(());
         }
 
-        let ptr = maybe_entry.as_mut_ptr();
+        loop {
+            if !callback.call(Address::from(entry.th32ProcessID as umem)) {
+                break;
+            }
 
-        std::iter::once(unsafe { Process32FirstW(*handle, ptr) })
-            .chain(std::iter::repeat_with(|| unsafe {
-                Process32NextW(*handle, ptr)
-            }))
-            .take_while(|b| b.is_ok())
-            .map(|_| unsafe { maybe_entry.assume_init() })
-            .map(|p| {
-                let address = Address::from(p.th32ProcessID as umem);
-                let len = p.szExeFile.iter().take_while(|&&c| c != 0).count();
+            if unsafe { Process32NextW(*handle, &mut entry) }.is_err() {
+                break;
+            }
+        }
 
-                let path = OsString::from_wide(&p.szExeFile[..len]);
+        Ok(())
+    }
+
+    /// Find process information by its internal address
+    fn process_info_by_address(&mut self, address: Address) -> Result<ProcessInfo> {
+        let pid = address.to_umem() as Pid;
+        let handle =
+            Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(conv_err)?);
+
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+        if unsafe { Process32FirstW(*handle, &mut entry) }.is_err() {
+            return Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound));
+        }
+
+        loop {
+            if entry.th32ProcessID as Pid == pid {
+                let len = entry.szExeFile.iter().take_while(|&&c| c != 0).count();
+
+                let path = OsString::from_wide(&entry.szExeFile[..len]);
                 let path = path.to_string_lossy();
                 let path = &*path;
                 let name = path.rsplit_once('\\').map(|(_, end)| end).unwrap_or(path);
 
-                self.cached_processes.push(ProcessInfo {
+                return Ok(ProcessInfo {
                     address,
-                    pid: address.to_umem() as _,
+                    pid,
                     state: ProcessState::Alive,
                     name: name.into(),
                     path: path.into(),
@@ -342,21 +349,14 @@ impl Os for WindowsOs {
                     dtb1: Address::invalid(),
                     dtb2: Address::invalid(),
                 });
+            }
 
-                address
-            })
-            .feed_into(callback);
+            if unsafe { Process32NextW(*handle, &mut entry) }.is_err() {
+                break;
+            }
+        }
 
-        Ok(())
-    }
-
-    /// Find process information by its internal address
-    fn process_info_by_address(&mut self, address: Address) -> Result<ProcessInfo> {
-        self.cached_processes
-            .iter()
-            .find(|p| p.address == address)
-            .cloned()
-            .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
+        Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
     }
 
     /// Construct a process by its info, borrowing the OS
@@ -379,10 +379,9 @@ impl Os for WindowsOs {
     /// # Arguments
     /// * `callback` - where to pass each matching module to. This is an opaque callback.
     fn module_address_list_callback(&mut self, mut callback: AddressCallback) -> Result<()> {
-        self.cached_modules = Self::query_kernel_modules()?;
-
-        (0..self.cached_modules.len())
-            .map(Address::from)
+        Self::query_kernel_modules()?
+            .into_iter()
+            .map(|m| m.base)
             .take_while(|a| callback.call(*a))
             .for_each(|_| {});
 
@@ -394,8 +393,9 @@ impl Os for WindowsOs {
     /// # Arguments
     /// * `address` - address where module's information resides in
     fn module_by_address(&mut self, address: Address) -> Result<ModuleInfo> {
-        self.cached_modules
-            .get(address.to_umem() as usize)
+        Self::query_kernel_modules()?
+            .into_iter()
+            .find(|km| km.base == address)
             .map(|km| ModuleInfo {
                 address,
                 size: km.size,
