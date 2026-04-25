@@ -409,7 +409,7 @@ impl Process for MacProcess {
         self.cached_module_maps
             .iter()
             .enumerate()
-            .filter(|_| target_arch.is_none() || Some(&self.info().sys_arch) == target_arch)
+            .filter(|_| target_arch.is_none() || Some(&self.info().proc_arch) == target_arch)
             .take_while(|(i, _)| {
                 callback.call(ModuleAddressInfo {
                     address: Address::from(*i as u64),
@@ -431,7 +431,7 @@ impl Process for MacProcess {
         address: Address,
         architecture: ArchitectureIdent,
     ) -> Result<ModuleInfo> {
-        if architecture != self.info.sys_arch {
+        if architecture != self.info.proc_arch {
             return Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound));
         }
 
@@ -456,7 +456,7 @@ impl Process for MacProcess {
                         .unwrap_or(path)
                         .into(),
                     path: path.into(),
-                    arch: self.info.sys_arch,
+                    arch: self.info.proc_arch,
                 }
             })
             .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
