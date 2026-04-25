@@ -1,7 +1,7 @@
 use memflow::os::process::*;
 use memflow::prelude::v1::*;
 
-use libc::{c_int, sysctl, CTL_KERN, KERN_PROCARGS2};
+use libc::{c_int, size_t, sysctl, CTL_KERN, KERN_ARGMAX, KERN_PROCARGS2};
 
 use libc::{sysconf, _SC_PAGESIZE};
 use libproc::{
@@ -28,6 +28,107 @@ use mem::ProcessVirtualMemory;
 pub mod process;
 pub use process::MacProcess;
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct ProcArgs {
+    pub exec_path: String,
+    pub argv: Vec<String>,
+}
+
+fn argmax() -> usize {
+    let mut mib: [c_int; 2] = [CTL_KERN, KERN_ARGMAX];
+    let mut value: c_int = 0;
+    let mut len = core::mem::size_of::<c_int>() as size_t;
+
+    let ret = unsafe {
+        sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as _,
+            (&mut value as *mut c_int).cast(),
+            &mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if ret == 0 && value > 0 {
+        value as usize
+    } else {
+        4096
+    }
+}
+
+pub(super) fn read_procargs2(pid: Pid) -> Result<Vec<u8>> {
+    let mut scratch = vec![0u8; argmax()];
+
+    let mut mib: [c_int; 3] = [CTL_KERN, KERN_PROCARGS2, pid as _];
+    let mut len = scratch.len() as size_t;
+
+    let ret = unsafe {
+        sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as _,
+            scratch.as_mut_ptr().cast(),
+            &mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if ret != 0 || len < 4 {
+        return Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown));
+    }
+
+    scratch.truncate(len);
+    Ok(scratch)
+}
+
+pub(super) fn parse_procargs2(data: &[u8]) -> Result<ProcArgs> {
+    if data.len() < 4 {
+        return Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown));
+    }
+
+    let mut argc_buf = [0u8; 4];
+    argc_buf.copy_from_slice(&data[..4]);
+    let argc = u32::from_ne_bytes(argc_buf) as usize;
+    let buf = &data[4..];
+
+    let mut idx = 0usize;
+    while idx < buf.len() && buf[idx] != 0 {
+        idx += 1;
+    }
+    if idx == buf.len() {
+        return Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown));
+    }
+
+    let exec_path = String::from_utf8_lossy(&buf[..idx]).into_owned();
+
+    while idx < buf.len() && buf[idx] == 0 {
+        idx += 1;
+    }
+
+    let mut argv = Vec::new();
+    for _ in 0..argc {
+        if idx >= buf.len() {
+            break;
+        }
+
+        let start = idx;
+        while idx < buf.len() && buf[idx] != 0 {
+            idx += 1;
+        }
+
+        if idx > start {
+            argv.push(String::from_utf8_lossy(&buf[start..idx]).into_owned());
+        }
+
+        if idx < buf.len() {
+            idx += 1;
+        }
+    }
+
+    Ok(ProcArgs { exec_path, argv })
+}
+
 fn get_arch() -> ArchitectureIdent {
     static ARCH: OnceLock<ArchitectureIdent> = OnceLock::new();
 
@@ -45,7 +146,6 @@ fn get_arch() -> ArchitectureIdent {
 
 pub struct MacOs {
     info: OsInfo,
-    scratch: Box<[u8]>,
     //cached_modules: Vec<KernelModule>,
 }
 
@@ -59,7 +159,6 @@ impl Clone for MacOs {
     fn clone(&self) -> Self {
         Self {
             info: self.info.clone(),
-            scratch: self.scratch.clone(),
             //cached_modules: vec![],
         }
     }
@@ -75,8 +174,6 @@ impl Default for MacOs {
 
         Self {
             info,
-            // TODO: call KERN_ARGMAX to figure out the actual value.
-            scratch: vec![0; 4096].into_boxed_slice(),
             //cached_modules: vec![],
         }
     }
@@ -109,79 +206,34 @@ impl Os for MacOs {
     }
 
     fn process_info_by_pid(&mut self, pid: Pid) -> Result<ProcessInfo> {
-        let us = std::process::id();
-
         let bsd_info =
-            lp::proc_pid::pidinfo::<lp::bsd_info::BSDInfo>(us as _, pid as _).map_err(|e| {
+            lp::proc_pid::pidinfo::<lp::bsd_info::BSDInfo>(pid as _, 0).map_err(|e| {
                 error!("bsd_info: {e}");
                 Error(ErrorOrigin::OsLayer, ErrorKind::Unknown)
             })?;
 
         // We could use lp::proc_pid::pidpath for path, but we already get it from procargs2
         let (path, command_line): (ReprCString, ReprCString) = {
-            let mut name: [c_int; 3] = [CTL_KERN, KERN_PROCARGS2, pid as _];
-            let mut len = self.scratch.len() - 4;
-            let ret = unsafe {
-                sysctl(
-                    name.as_mut_ptr(),
-                    name.len() as _,
-                    self.scratch.as_mut_ptr().cast(),
-                    &mut len,
-                    core::ptr::null_mut(),
-                    0,
-                )
-            };
+            let fallback_path = bsd_info
+                .pbi_comm
+                .iter()
+                .copied()
+                .map(|b| b as u8)
+                .take_while(|b| *b != 0)
+                .collect::<Vec<u8>>();
+            let fallback_path = String::from_utf8_lossy(&fallback_path).into_owned();
 
-            if ret != 0 {
-                len = 0;
-            }
-
-            // We skip the first arg, because that is the executable path.
-            let mut num_args = u32::from_ne_bytes(self.scratch[..4].try_into().unwrap()) + 1;
-
-            let buf = &mut self.scratch[4..(4 + len)];
-
-            let mut start_idx = 0;
-            let mut start_idx_stripped = 0;
-            let mut idx = 0;
-
-            for (i, b) in buf.iter_mut().enumerate() {
-                if num_args == 0 {
-                    break;
+            match read_procargs2(pid).and_then(|d| parse_procargs2(&d)) {
+                Ok(parsed) => {
+                    let path = if parsed.exec_path.is_empty() {
+                        fallback_path.as_str()
+                    } else {
+                        parsed.exec_path.as_str()
+                    };
+                    (path.into(), parsed.argv.join(" ").into())
                 }
-
-                if *b == 0 {
-                    *b = b' ';
-                    num_args -= 1;
-                    if start_idx == 0 {
-                        start_idx = i + 1;
-                        start_idx_stripped = i + 1;
-                    } else if start_idx_stripped == i {
-                        num_args += 1;
-                        start_idx_stripped = i + 1;
-                    }
-                }
-
-                idx = i;
+                Err(_) => (fallback_path.into(), "".into()),
             }
-
-            let path = if start_idx == 0 {
-                let b = bsd_info.pbi_comm.split(|v| *v == 0).next().unwrap_or(&[]);
-                unsafe { &*(b as *const [_] as *const [u8]) }
-            } else {
-                &buf[..(start_idx - 1)]
-            };
-
-            (
-                std::str::from_utf8(path).unwrap_or_default().into(),
-                std::str::from_utf8(if start_idx_stripped <= idx {
-                    &buf[start_idx_stripped..idx]
-                } else {
-                    &[]
-                })
-                .unwrap_or_default()
-                .into(),
-            )
         };
         let name = path.split(&['/', '\\'][..]).last().unwrap().into();
 

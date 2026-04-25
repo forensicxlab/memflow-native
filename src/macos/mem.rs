@@ -36,6 +36,23 @@ impl ProcessVirtualMemory {
             pid: info.pid,
         })
     }
+
+    pub fn new_unavailable(pid: u32) -> Self {
+        Self {
+            port: MACH_PORT_NULL,
+            pid,
+        }
+    }
+
+    pub(crate) fn ensure_port(&mut self) -> Result<mach_port_t> {
+        // Acquire task port lazily so callers that only need process metadata can still work
+        // when task_for_pid is restricted.
+        if self.port == MACH_PORT_NULL {
+            self.port = get_task(self.pid)?;
+        }
+
+        Ok(self.port)
+    }
 }
 
 // Helper trait for `process_rw` to be generic.
@@ -113,9 +130,11 @@ impl ProcessVirtualMemory {
             mut out_fail,
         }: MemOps<CTup3<Address, Address, T>, CTup2<Address, T>>,
     ) -> Result<()> {
+        let port = self.ensure_port()?;
+
         for CTup3(addr, meta_addr, buf) in inp {
             let written =
-                unsafe { T::do_rw(self.port, buf.as_ptr() as _, addr.to_umem() as _, buf.len()) }
+                unsafe { T::do_rw(port, buf.as_ptr() as _, addr.to_umem() as _, buf.len()) }
                     .unwrap_or(0);
 
             let (succeed, fail) = buf.split_at(written as _);

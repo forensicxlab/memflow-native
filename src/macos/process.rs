@@ -118,10 +118,10 @@ impl Clone for MacProcess {
 impl MacProcess {
     pub fn try_new(info: ProcessInfo) -> Result<Self> {
         Ok(Self {
-            virt_mem: ProcessVirtualMemory::try_new(&info).map_err(|e| {
-                log::error!("Unable to get port");
-                e
-            })?,
+            virt_mem: ProcessVirtualMemory::try_new(&info).unwrap_or_else(|e| {
+                log::warn!("Unable to get task port for pid {}: {e:?}", info.pid);
+                ProcessVirtualMemory::new_unavailable(info.pid)
+            }),
             info,
             cached_maps: vec![],
             cached_module_maps: vec![],
@@ -135,9 +135,10 @@ impl MacProcess {
 
         let mut count =
             (core::mem::size_of::<task_dyld_info>() / core::mem::size_of::<natural_t>()) as _;
+        let port = self.virt_mem.ensure_port()?;
         let ret = unsafe {
             task_info(
-                self.virt_mem.port,
+                port,
                 TASK_DYLD_INFO,
                 &mut info as *mut task_dyld_info as *mut _,
                 &mut count,
