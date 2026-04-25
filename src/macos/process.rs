@@ -178,7 +178,7 @@ impl MacProcess {
             // And now, let's process the elements
             for i in &info_buf[..size] {
                 // TODO: do the string reads concurrently
-                let name = self.read_char_string(i.image_file_path.into())?;
+                let name = self.read_utf8_lossy(i.image_file_path.into(), 4096)?;
 
                 let start = Address::from(i.image_load_address);
                 let mut end = start;
@@ -205,7 +205,7 @@ impl MacProcess {
                         break;
                     }
                     if ret < size {
-                        panic!("Invalid size returned from proc_pidinfo ({ret} vs {size})");
+                        return Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown));
                     }
 
                     let ino = prwpi.prp_vip.vip_vi.vi_stat.vst_ino;
@@ -305,7 +305,7 @@ impl MacProcess {
         Ok(())
     }
 
-    pub fn update_cached_maps(&mut self, mut start: Address, end: Address) {
+    pub fn update_cached_maps(&mut self, mut start: Address, end: Address) -> Result<()> {
         let mut pri: proc_regioninfo = unsafe { MaybeUninit::zeroed().assume_init() };
         let mut last_pri: proc_regioninfo = unsafe { MaybeUninit::zeroed().assume_init() };
 
@@ -327,7 +327,7 @@ impl MacProcess {
                 break;
             }
             if ret < size {
-                panic!("Invalid size returned from proc_pidinfo ({ret} vs {size})");
+                return Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown));
             }
 
             start = Address::from(pri.pri_address);
@@ -383,6 +383,8 @@ impl MacProcess {
         }
 
         self.cached_maps.sort_by_key(|v| v.0);
+
+        Ok(())
     }
 }
 
@@ -515,7 +517,9 @@ impl Process for MacProcess {
         end: Address,
         out: MemoryRangeCallback,
     ) {
-        self.update_cached_maps(start, end);
+        if self.update_cached_maps(start, end).is_err() {
+            return;
+        }
 
         self.cached_maps
             .iter()
@@ -531,7 +535,7 @@ impl Process for MacProcess {
             })
             .map(|(s, sz, perms)| {
                 if s + sz > end {
-                    let diff = s - end;
+                    let diff = s + sz - end;
                     (s, sz - diff as umem, perms)
                 } else {
                     (s, sz, perms)

@@ -84,6 +84,8 @@ impl<'a> RWSlice for CSliceRef<'a, u8> {
 
         for off in iter {
             let size = core::cmp::min(size - off, u32::MAX as _);
+            let local = (local as usize + off) as *const c_void;
+            let remote = (remote as usize + off) as *const c_void;
 
             let ret = mach_vm_write(port, remote as _, local as _, size as u32);
 
@@ -112,11 +114,12 @@ impl<'a> RWSlice for CSliceMut<'a, u8> {
         // mach_vm_read_list exists, however, it seems to allocate new buffers, meaning, we would
         // need to perform a second copy, and free those buffers immediately afterwards (1 syscall
         // per buffer!). Therefore, we are doing sequential read syscall per buffer.
-        let ret = mach_vm_read_overwrite(port, remote as _, size as _, local as _, &mut 0);
+        let mut out_size = 0;
+        let ret = mach_vm_read_overwrite(port, remote as _, size as _, local as _, &mut out_size);
         if ret != KERN_SUCCESS {
             return Err(Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadMemory));
         }
-        Ok(size)
+        Ok(out_size as usize)
     }
 }
 
@@ -133,9 +136,12 @@ impl ProcessVirtualMemory {
         let port = self.ensure_port()?;
 
         for CTup3(addr, meta_addr, buf) in inp {
-            let written =
-                unsafe { T::do_rw(port, buf.as_ptr() as _, addr.to_umem() as _, buf.len()) }
-                    .unwrap_or(0);
+            let written = match unsafe {
+                T::do_rw(port, buf.as_ptr() as _, addr.to_umem() as _, buf.len())
+            } {
+                Ok(written) => written,
+                Err(err) => return Err(err),
+            };
 
             let (succeed, fail) = buf.split_at(written as _);
 
