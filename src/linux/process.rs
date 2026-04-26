@@ -297,7 +297,7 @@ impl Process for LinuxProcess {
             }
         }
     }
-
+    #[cfg(memflow_plugin_api = "2")]
     fn envar_list_callback(
         &mut self,
         target_arch: Option<&ArchitectureIdent>,

@@ -650,6 +650,7 @@ impl Process for MacProcess {
             .feed_into(out);
     }
 
+    #[cfg(memflow_plugin_api = "2")]
     fn envar_list_callback(
         &mut self,
         target_arch: Option<&ArchitectureIdent>,
