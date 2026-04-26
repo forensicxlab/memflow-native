@@ -138,9 +138,12 @@ impl ProcessVirtualMemory {
         let port = self.ensure_port()?;
 
         for CTup3(addr, meta_addr, buf) in inp {
-            let written =
-                unsafe { T::do_rw(port, buf.as_ptr() as _, addr.to_umem() as _, buf.len()) }
-                    .unwrap_or(0);
+            let written = match unsafe {
+                T::do_rw(port, buf.as_ptr() as _, addr.to_umem() as _, buf.len())
+            } {
+                Ok(written) => written,
+                Err(err) => return Err(err),
+            };
 
             let (succeed, fail) = buf.split_at(written as _);
 

@@ -3,10 +3,14 @@ use memflow::os::process::*;
 use memflow::prelude::v1::*;
 use memflow::types::gap_remover::GapRemover;
 
-use super::{conv_err, ProcessVirtualMemory};
+use super::{conv_err, conv_ntstatus};
+use crate::windows::mem::ProcessVirtualMemory;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
-use windows::Win32::Foundation::{HINSTANCE, HMODULE, STILL_ACTIVE};
+use windows::Wdk::System::Threading::{
+    NtQueryInformationProcess, ProcessBasicInformation, ProcessWow64Information,
+};
+use windows::Win32::Foundation::{HINSTANCE, HMODULE, STATUS_INVALID_INFO_CLASS, STILL_ACTIVE};
 
 use windows::Win32::System::Memory::{
     VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_FREE, MEM_RESERVE, PAGE_EXECUTE,
@@ -19,7 +23,10 @@ use windows::Win32::System::ProcessStatus::{
     LIST_MODULES_64BIT,
 };
 
-use core::mem::size_of;
+use windows::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
+
+use core::mem::{size_of, size_of_val};
+use core::ptr;
 
 #[derive(Clone)]
 pub struct WindowsProcess {
@@ -37,15 +44,6 @@ impl WindowsProcess {
             info,
             cached_modules: vec![],
         })
-    }
-
-    fn process_exists(&self) -> bool {
-        let pid = Pid::from_u32(self.info.pid);
-        let mut system = System::new_with_specifics(
-            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
-        );
-        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-        system.process(pid).is_some()
     }
 
     fn collect_envars(&self) -> Result<Vec<EnvVarInfo>> {
@@ -81,10 +79,27 @@ cglue_impl_group!(WindowsProcess, IntoProcessInstance, {});
 impl Process for WindowsProcess {
     /// Retrieves the state of the process
     fn state(&mut self) -> ProcessState {
-        if self.process_exists() {
+        let mut info = PROCESS_BASIC_INFORMATION::default();
+
+        let status = unsafe {
+            NtQueryInformationProcess(
+                **self.virt_mem.handle,
+                ProcessBasicInformation,
+                &mut info as *mut _ as _,
+                size_of_val(&info) as _,
+                ptr::null_mut(),
+            )
+        };
+
+        if status.is_err() {
+            let _mapped = conv_ntstatus(status);
+            return ProcessState::Unknown;
+        }
+
+        if info.ExitStatus == STILL_ACTIVE {
             ProcessState::Alive
         } else {
-            ProcessState::Dead(STILL_ACTIVE.0)
+            ProcessState::Dead(info.ExitStatus.0)
         }
     }
 
@@ -218,13 +233,49 @@ impl Process for WindowsProcess {
     ///
     /// This will generally be for the initial executable that was run
     fn primary_module_address(&mut self) -> Result<Address> {
-        let proc_arch = self.info.proc_arch;
-        self.module_list_arch(Some(&proc_arch))
-            .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))?
-            .into_iter()
-            .next()
-            .map(|m| m.base)
-            .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
+        let mut info = PROCESS_BASIC_INFORMATION::default();
+
+        let status = unsafe {
+            NtQueryInformationProcess(
+                **self.virt_mem.handle,
+                ProcessBasicInformation,
+                &mut info as *mut _ as _,
+                size_of_val(&info) as _,
+                ptr::null_mut(),
+            )
+        };
+
+        if status.is_err() {
+            return Err(conv_ntstatus(status));
+        }
+
+        let mut wow64_peb = 0usize;
+        let wow64_status = unsafe {
+            NtQueryInformationProcess(
+                **self.virt_mem.handle,
+                ProcessWow64Information,
+                &mut wow64_peb as *mut _ as _,
+                size_of_val(&wow64_peb) as _,
+                ptr::null_mut(),
+            )
+        };
+
+        if wow64_status.is_err() && wow64_status != STATUS_INVALID_INFO_CLASS {
+            return Err(conv_ntstatus(wow64_status));
+        }
+
+        if wow64_peb != 0 {
+            return self
+                .read_addr32(Address::from(wow64_peb as umem + 0x8))
+                .data_part();
+        }
+
+        let peb = Address::from(info.PebBaseAddress as umem);
+        match self.info.proc_arch.into_obj().bits() {
+            64 => self.read_addr64(peb + 0x10).data_part(),
+            32 => self.read_addr32(peb + 0x8).data_part(),
+            _ => Err(Error(ErrorOrigin::OsLayer, ErrorKind::InvalidArchitecture)),
+        }
     }
 
     fn module_import_list_callback(

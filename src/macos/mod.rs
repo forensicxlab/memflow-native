@@ -90,7 +90,9 @@ pub(super) fn parse_procargs2(data: &[u8]) -> Result<ProcArgs> {
         return Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown));
     }
 
-    let argc = u32::from_ne_bytes(data[..4].try_into().unwrap()) as usize;
+    let mut argc_buf = [0u8; 4];
+    argc_buf.copy_from_slice(&data[..4]);
+    let argc = u32::from_ne_bytes(argc_buf) as usize;
     let buf = &data[4..];
 
     let mut idx = 0usize;

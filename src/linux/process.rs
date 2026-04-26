@@ -12,33 +12,64 @@ use itertools::Itertools;
 
 pub struct LinuxProcess {
     virt_mem: ProcessVirtualMemory,
-    proc: procfs::process::Process,
+    pid: pid_t,
     info: ProcessInfo,
-    cached_maps: Vec<procfs::process::MemoryMap>,
-    cached_module_maps: Vec<procfs::process::MemoryMap>,
 }
 
 impl Clone for LinuxProcess {
     fn clone(&self) -> Self {
         Self {
             virt_mem: self.virt_mem.clone(),
-            proc: procfs::process::Process::new(self.proc.pid()).unwrap(),
+            pid: self.pid,
             info: self.info.clone(),
-            cached_maps: self.cached_maps.clone(),
-            cached_module_maps: self.cached_module_maps.clone(),
         }
     }
 }
 
 impl LinuxProcess {
+    fn proc_handle(&self) -> Result<procfs::process::Process> {
+        procfs::process::Process::new(self.pid)
+            .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))
+    }
+
+    fn module_maps(&self) -> Result<Vec<procfs::process::MemoryMap>> {
+        let maps = self
+            .proc_handle()?
+            .maps()
+            .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))?
+            .memory_maps;
+
+        Ok(maps
+            .into_iter()
+            .filter(|map| matches!(map.pathname, MMapPath::Path(_)))
+            .coalesce(|m1, m2| {
+                if m1.address.1 == m2.address.0
+                    // When the file gets mapped in memory, offsets change.
+                    // && m2.offset - m1.offset == m1.address.1 - m1.address.0
+                    && m1.dev == m2.dev
+                    && m1.inode == m2.inode
+                {
+                    Ok(procfs::process::MemoryMap {
+                        address: (m1.address.0, m2.address.1),
+                        perms: MMPermissions::NONE,
+                        offset: m1.offset,
+                        dev: m1.dev,
+                        inode: m1.inode,
+                        pathname: m1.pathname,
+                        extension: MMapExtension::default(),
+                    })
+                } else {
+                    Err((m1, m2))
+                }
+            })
+            .collect())
+    }
+
     pub fn try_new(info: ProcessInfo) -> Result<Self> {
         Ok(Self {
             virt_mem: ProcessVirtualMemory::new(&info),
-            proc: procfs::process::Process::new(info.pid as pid_t)
-                .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))?,
+            pid: info.pid as pid_t,
             info,
-            cached_maps: vec![],
-            cached_module_maps: vec![],
         })
     }
 
@@ -79,7 +110,7 @@ impl LinuxProcess {
     }
 
     fn collect_envars(&self) -> Result<Vec<EnvVarInfo>> {
-        let path = format!("/proc/{}/environ", self.proc.pid());
+        let path = format!("/proc/{}/environ", self.pid);
         let data = std::fs::read(path)
             .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::EnvarNotFound))?;
 
@@ -116,40 +147,9 @@ impl Process for LinuxProcess {
         target_arch: Option<&ArchitectureIdent>,
         mut callback: ModuleAddressCallback,
     ) -> Result<()> {
-        self.cached_maps = self
-            .proc
-            .maps()
-            .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))?
-            .memory_maps;
+        let module_maps = self.module_maps()?;
 
-        self.cached_module_maps = self
-            .cached_maps
-            .iter()
-            .filter(|map| matches!(map.pathname, MMapPath::Path(_)))
-            .cloned()
-            .coalesce(|m1, m2| {
-                if m1.address.1 == m2.address.0
-                    // When the file gets mapped in memory, offsets change.
-                    // && m2.offset - m1.offset == m1.address.1 - m1.address.0
-                    && m1.dev == m2.dev
-                    && m1.inode == m2.inode
-                {
-                    Ok(procfs::process::MemoryMap {
-                        address: (m1.address.0, m2.address.1),
-                        perms: MMPermissions::NONE,
-                        offset: m1.offset,
-                        dev: m1.dev,
-                        inode: m1.inode,
-                        pathname: m1.pathname,
-                        extension: MMapExtension::default(),
-                    })
-                } else {
-                    Err((m1, m2))
-                }
-            })
-            .collect();
-
-        self.cached_module_maps
+        module_maps
             .iter()
             .enumerate()
             .filter(|_| target_arch.is_none() || Some(&self.info().sys_arch) == target_arch)
@@ -178,9 +178,9 @@ impl Process for LinuxProcess {
             return Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound));
         }
 
-        // TODO: create cached_module_maps if its empty
+        let module_maps = self.module_maps()?;
 
-        self.cached_module_maps
+        module_maps
             .get(address.to_umem() as usize)
             .map(|map| ModuleInfo {
                 address,
@@ -249,53 +249,52 @@ impl Process for LinuxProcess {
         end: Address,
         out: MemoryRangeCallback,
     ) {
-        if let Ok(maps) = self
-            .proc
-            .maps()
-            .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))
-        {
-            self.cached_maps = maps.memory_maps;
-
-            self.cached_maps
-                .iter()
-                .filter(|map| {
-                    Address::from(map.address.1) > start && Address::from(map.address.0) < end
-                })
-                .filter(|m| m.perms.contains(MMPermissions::READ))
-                .map(|map| {
-                    (
-                        Address::from(map.address.0),
-                        (map.address.1 - map.address.0) as umem,
-                        PageType::empty()
-                            .noexec(!map.perms.contains(MMPermissions::EXECUTE))
-                            .write(map.perms.contains(MMPermissions::WRITE)),
-                    )
-                })
-                .map(|(s, sz, perms)| {
-                    if s < start {
-                        let diff = start - s;
-                        (start, sz - diff as umem, perms)
-                    } else {
-                        (s, sz, perms)
-                    }
-                })
-                .map(|(s, sz, perms)| {
-                    if s + sz > end {
-                        let diff = s - end;
-                        (s, sz - diff as umem, perms)
-                    } else {
-                        (s, sz, perms)
-                    }
-                })
-                .coalesce(|a, b| {
-                    if gap_size >= 0 && a.0 + a.1 + gap_size as umem >= b.0 && a.2 == b.2 {
-                        Ok((a.0, (b.0 - a.0) as umem + b.1, a.2))
-                    } else {
-                        Err((a, b))
-                    }
-                })
-                .map(<_>::into)
-                .feed_into(out);
+        if let Ok(proc) = self.proc_handle() {
+            if let Ok(maps) = proc
+                .maps()
+                .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))
+            {
+                maps.memory_maps
+                    .into_iter()
+                    .filter(|map| {
+                        Address::from(map.address.1) > start && Address::from(map.address.0) < end
+                    })
+                    .filter(|m| m.perms.contains(MMPermissions::READ))
+                    .map(|map| {
+                        (
+                            Address::from(map.address.0),
+                            (map.address.1 - map.address.0) as umem,
+                            PageType::empty()
+                                .noexec(!map.perms.contains(MMPermissions::EXECUTE))
+                                .write(map.perms.contains(MMPermissions::WRITE)),
+                        )
+                    })
+                    .map(|(s, sz, perms)| {
+                        if s < start {
+                            let diff = start - s;
+                            (start, sz - diff as umem, perms)
+                        } else {
+                            (s, sz, perms)
+                        }
+                    })
+                    .map(|(s, sz, perms)| {
+                        if s + sz > end {
+                            let diff = (s + sz) - end;
+                            (s, sz - diff as umem, perms)
+                        } else {
+                            (s, sz, perms)
+                        }
+                    })
+                    .coalesce(|a, b| {
+                        if gap_size >= 0 && a.0 + a.1 + gap_size as umem >= b.0 && a.2 == b.2 {
+                            Ok((a.0, (b.0 - a.0) as umem + b.1, a.2))
+                        } else {
+                            Err((a, b))
+                        }
+                    })
+                    .map(<_>::into)
+                    .feed_into(out);
+            }
         }
     }
 

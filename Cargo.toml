@@ -3,6 +3,7 @@ name = "memflow-native"
 version = "0.2.6"
 authors = ["Aurimas Blažulionis <0x60@pm.me>", "ko1N <ko1N1337@gmail.com>", "k1nd0ne <k1nd0ne@mail.com>"]
 edition = "2021"
+build = "build.rs"
 description = "System call based proxy-OS for memflow"
 documentation = "https://docs.rs/memflow-native"
 readme = "README.md"
@@ -20,7 +21,10 @@ goblin = "0.9"
 itertools = "0.14"
 libc = { version = "0.2" }
 log = "0.4"
-memflow = { git = "https://github.com/forensicxlab/memflow", branch = "main", features = ["plugins", "goblin"] }
+memflow = { version = "0.2", features = ["plugins", "goblin"] }
+
+[build-dependencies]
+memflow = { version = "0.2", features = ["plugins"] }
 
 # we keep procfs on version 0.15.x because it does not build properly with the backtrace on 0.16.x
 # tracking issue: https://github.com/eminence/procfs/pull/309
@@ -29,6 +33,7 @@ procfs = { version = "=0.15.1", features = ["backtrace"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = [
+	"Wdk_System_SystemInformation",
 	"Wdk_System_Threading",
 	"Win32_Foundation",
 	"Win32_Security",
