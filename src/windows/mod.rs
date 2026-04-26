@@ -1,8 +1,16 @@
 use memflow::os::process::*;
 use memflow::prelude::v1::*;
 
-use windows::core::PCSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::core::{HRESULT, PCSTR};
+use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_INVALID_ADDRESS, ERROR_INVALID_FLAGS, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
+    ERROR_NOACCESS, ERROR_NOT_FOUND, ERROR_PARTIAL_COPY, ERROR_PRIVILEGE_NOT_HELD, HANDLE,
+    NTSTATUS, STATUS_ACCESS_DENIED, STATUS_INFO_LENGTH_MISMATCH, STATUS_INSUFFICIENT_RESOURCES,
+    STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
+    STATUS_NOT_IMPLEMENTED, STATUS_NO_MEMORY, STATUS_PRIVILEGE_NOT_HELD,
+};
 
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -15,21 +23,42 @@ use windows::Win32::Security::{
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
 };
 
-use core::mem::{size_of, MaybeUninit};
-use core::ptr;
+use core::mem::{align_of, size_of};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 
-pub mod mem;
-use mem::ProcessVirtualMemory;
+const SYSTEM_MODULE_INFORMATION_CLASS: SYSTEM_INFORMATION_CLASS = SYSTEM_INFORMATION_CLASS(11);
+const MODULE_QUERY_INITIAL_CAPACITY: usize = 256 * 1024;
+const MODULE_QUERY_MAX_RETRIES: usize = 6;
 
+pub mod mem;
 pub mod process;
 pub use process::WindowsProcess;
 
 pub mod keyboard;
 pub use keyboard::{WindowsKeyboard, WindowsKeyboardState};
 
-struct KernelModule {}
+struct KernelModule {
+    base: Address,
+    size: umem,
+    path: ReprCString,
+    name: ReprCString,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct RtlProcessModuleInformation {
+    Section: *mut core::ffi::c_void,
+    MappedBase: *mut core::ffi::c_void,
+    ImageBase: *mut core::ffi::c_void,
+    ImageSize: u32,
+    Flags: u32,
+    LoadOrderIndex: u16,
+    InitOrderIndex: u16,
+    LoadCount: u16,
+    OffsetToFileName: u16,
+    FullPathName: [u8; 256],
+}
 
 pub(crate) struct Handle(HANDLE);
 
@@ -53,10 +82,78 @@ impl Drop for Handle {
     }
 }
 
-pub fn conv_err(_err: windows::core::Error) -> Error {
-    // TODO: proper error kind
-    // TODO: proper origin
-    Error(ErrorOrigin::OsLayer, ErrorKind::Unknown)
+pub fn conv_err(err: windows::core::Error) -> Error {
+    let kind = match err.code() {
+        c if c == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0)
+            || c == HRESULT::from_win32(ERROR_INVALID_FLAGS.0)
+            || c == HRESULT::from_win32(ERROR_BAD_LENGTH.0)
+            || c == HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) =>
+        {
+            ErrorKind::ArgValidation
+        }
+        c if c == HRESULT::from_win32(ERROR_ACCESS_DENIED.0)
+            || c == HRESULT::from_win32(ERROR_PRIVILEGE_NOT_HELD.0) =>
+        {
+            ErrorKind::NotSupported
+        }
+        c if c == HRESULT::from_win32(ERROR_INVALID_HANDLE.0) => ErrorKind::ProcessNotFound,
+        c if c == HRESULT::from_win32(ERROR_NOT_FOUND.0) => ErrorKind::NotFound,
+        c if c == HRESULT::from_win32(ERROR_NOACCESS.0)
+            || c == HRESULT::from_win32(ERROR_INVALID_ADDRESS.0)
+            || c == HRESULT::from_win32(ERROR_PARTIAL_COPY.0) =>
+        {
+            ErrorKind::UnableToReadMemory
+        }
+        _ => ErrorKind::Unknown,
+    };
+
+    Error(ErrorOrigin::OsLayer, kind)
+}
+
+pub(crate) fn conv_ntstatus(status: NTSTATUS) -> Error {
+    let kind = match status {
+        STATUS_ACCESS_DENIED | STATUS_PRIVILEGE_NOT_HELD => ErrorKind::NotSupported,
+        STATUS_INVALID_PARAMETER => ErrorKind::ArgValidation,
+        STATUS_NOT_IMPLEMENTED | STATUS_INVALID_INFO_CLASS => ErrorKind::NotSupported,
+        STATUS_INSUFFICIENT_RESOURCES | STATUS_NO_MEMORY => ErrorKind::Unknown,
+        STATUS_INVALID_HANDLE => ErrorKind::ProcessNotFound,
+        _ => ErrorKind::Unknown,
+    };
+
+    Error(ErrorOrigin::OsLayer, kind)
+}
+
+fn split_basename(path: &str) -> &str {
+    path.rsplit_once('\\')
+        .or_else(|| path.rsplit_once('/'))
+        .map(|(_, name)| name)
+        .unwrap_or(path)
+}
+
+fn parse_module_path(info: &RtlProcessModuleInformation) -> (ReprCString, ReprCString) {
+    let path_end = info
+        .FullPathName
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(info.FullPathName.len());
+
+    let path_raw = &info.FullPathName[..path_end];
+    let path = String::from_utf8_lossy(path_raw);
+    let path = path.as_ref();
+
+    let name = if (info.OffsetToFileName as usize) < path_end {
+        let name_raw = &info.FullPathName[info.OffsetToFileName as usize..path_end];
+        let parsed = String::from_utf8_lossy(name_raw);
+        if parsed.is_empty() {
+            split_basename(path).to_owned()
+        } else {
+            parsed.into_owned()
+        }
+    } else {
+        split_basename(path).to_owned()
+    };
+
+    (path.into(), name.into())
 }
 
 unsafe fn enable_debug_privilege() -> Result<()> {
@@ -97,8 +194,6 @@ unsafe fn enable_debug_privilege() -> Result<()> {
 
 pub struct WindowsOs {
     info: OsInfo,
-    cached_processes: Vec<ProcessInfo>,
-    cached_modules: Vec<KernelModule>,
 }
 
 impl WindowsOs {
@@ -112,14 +207,91 @@ impl WindowsOs {
 
         Ok(Default::default())
     }
+
+    fn query_kernel_modules() -> Result<Vec<KernelModule>> {
+        let mut buffer = vec![0u8; MODULE_QUERY_INITIAL_CAPACITY];
+
+        for _ in 0..MODULE_QUERY_MAX_RETRIES {
+            let mut return_len = 0u32;
+            let status = unsafe {
+                NtQuerySystemInformation(
+                    SYSTEM_MODULE_INFORMATION_CLASS,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as u32,
+                    &mut return_len,
+                )
+            };
+
+            if status == STATUS_INFO_LENGTH_MISMATCH {
+                let table_off = align_of::<RtlProcessModuleInformation>();
+                let next_len = usize::max(
+                    buffer.len().saturating_mul(2),
+                    (return_len as usize).saturating_add(table_off),
+                );
+                buffer.resize(next_len, 0);
+                continue;
+            }
+
+            if status.is_err() {
+                return Err(conv_ntstatus(status));
+            }
+
+            let valid_len = if return_len as usize > buffer.len() {
+                buffer.len()
+            } else {
+                return_len as usize
+            };
+
+            let data = &buffer[..valid_len];
+            let table_off = align_of::<RtlProcessModuleInformation>();
+
+            if data.len() < table_off {
+                return Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown));
+            }
+
+            let mut header_buf = [0u8; core::mem::size_of::<u32>()];
+            header_buf.copy_from_slice(&data[..core::mem::size_of::<u32>()]);
+            let header_number = u32::from_ne_bytes(header_buf);
+            let entry_size = core::mem::size_of::<RtlProcessModuleInformation>();
+            let entries_len = header_number as usize;
+            let table_len = entries_len
+                .checked_mul(entry_size)
+                .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown))?;
+            let table_end = table_off
+                .checked_add(table_len)
+                .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown))?;
+
+            if table_end > data.len() {
+                return Err(Error(ErrorOrigin::OsLayer, ErrorKind::ArgValidation));
+            }
+
+            let mut parsed = Vec::with_capacity(entries_len);
+            for idx in 0..entries_len {
+                let module_off = table_off + idx * entry_size;
+                let module = unsafe {
+                    (data.as_ptr().add(module_off) as *const RtlProcessModuleInformation)
+                        .read_unaligned()
+                };
+                let (path, name) = parse_module_path(&module);
+                parsed.push(KernelModule {
+                    base: Address::from(module.ImageBase as umem),
+                    size: module.ImageSize as umem,
+                    path,
+                    name,
+                });
+            }
+
+            return Ok(parsed);
+        }
+
+        Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown))
+    }
 }
 
 impl Clone for WindowsOs {
     fn clone(&self) -> Self {
         Self {
             info: self.info.clone(),
-            cached_processes: vec![],
-            cached_modules: vec![],
         }
     }
 }
@@ -132,11 +304,7 @@ impl Default for WindowsOs {
             arch: ArchitectureIdent::X86(64, false),
         };
 
-        Self {
-            info,
-            cached_modules: vec![],
-            cached_processes: vec![],
-        }
+        Self { info }
     }
 }
 
@@ -147,39 +315,55 @@ impl Os for WindowsOs {
     /// Walks a process list and calls a callback for each process structure address
     ///
     /// The callback is fully opaque. We need this style so that C FFI can work seamlessly.
-    fn process_address_list_callback(&mut self, callback: AddressCallback) -> Result<()> {
+    fn process_address_list_callback(&mut self, mut callback: AddressCallback) -> Result<()> {
         let handle =
             Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(conv_err)?);
 
-        let mut maybe_entry = MaybeUninit::<PROCESSENTRY32W>::uninit();
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
 
-        unsafe {
-            ptr::write(
-                &mut (*maybe_entry.as_mut_ptr()).dwSize,
-                size_of::<PROCESSENTRY32W>() as u32,
-            );
+        if unsafe { Process32FirstW(*handle, &mut entry) }.is_err() {
+            return Ok(());
         }
 
-        let ptr = maybe_entry.as_mut_ptr();
+        loop {
+            if !callback.call(Address::from(entry.th32ProcessID as umem)) {
+                break;
+            }
 
-        std::iter::once(unsafe { Process32FirstW(*handle, ptr) })
-            .chain(std::iter::repeat_with(|| unsafe {
-                Process32NextW(*handle, ptr)
-            }))
-            .take_while(|b| b.is_ok())
-            .map(|_| unsafe { maybe_entry.assume_init() })
-            .map(|p| {
-                let address = Address::from(p.th32ProcessID as umem);
-                let len = p.szExeFile.iter().take_while(|&&c| c != 0).count();
+            if unsafe { Process32NextW(*handle, &mut entry) }.is_err() {
+                break;
+            }
+        }
 
-                let path = OsString::from_wide(&p.szExeFile[..len]);
+        Ok(())
+    }
+
+    /// Find process information by its internal address
+    fn process_info_by_address(&mut self, address: Address) -> Result<ProcessInfo> {
+        let pid = address.to_umem() as Pid;
+        let handle =
+            Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(conv_err)?);
+
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+        if unsafe { Process32FirstW(*handle, &mut entry) }.is_err() {
+            return Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound));
+        }
+
+        loop {
+            if entry.th32ProcessID as Pid == pid {
+                let len = entry.szExeFile.iter().take_while(|&&c| c != 0).count();
+
+                let path = OsString::from_wide(&entry.szExeFile[..len]);
                 let path = path.to_string_lossy();
                 let path = &*path;
                 let name = path.rsplit_once('\\').map(|(_, end)| end).unwrap_or(path);
 
-                self.cached_processes.push(ProcessInfo {
+                return Ok(ProcessInfo {
                     address,
-                    pid: address.to_umem() as _,
+                    pid,
                     state: ProcessState::Alive,
                     name: name.into(),
                     path: path.into(),
@@ -190,21 +374,14 @@ impl Os for WindowsOs {
                     dtb1: Address::invalid(),
                     dtb2: Address::invalid(),
                 });
+            }
 
-                address
-            })
-            .feed_into(callback);
+            if unsafe { Process32NextW(*handle, &mut entry) }.is_err() {
+                break;
+            }
+        }
 
-        Ok(())
-    }
-
-    /// Find process information by its internal address
-    fn process_info_by_address(&mut self, address: Address) -> Result<ProcessInfo> {
-        self.cached_processes
-            .iter()
-            .find(|p| p.address == address)
-            .cloned()
-            .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
+        Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
     }
 
     /// Construct a process by its info, borrowing the OS
@@ -227,8 +404,9 @@ impl Os for WindowsOs {
     /// # Arguments
     /// * `callback` - where to pass each matching module to. This is an opaque callback.
     fn module_address_list_callback(&mut self, mut callback: AddressCallback) -> Result<()> {
-        (0..self.cached_modules.len())
-            .map(Address::from)
+        Self::query_kernel_modules()?
+            .into_iter()
+            .map(|m| m.base)
             .take_while(|a| callback.call(*a))
             .for_each(|_| {});
 
@@ -239,29 +417,20 @@ impl Os for WindowsOs {
     ///
     /// # Arguments
     /// * `address` - address where module's information resides in
-    fn module_by_address(&mut self, _address: Address) -> Result<ModuleInfo> {
-        /*self.cached_modules
-        .iter()
-        .skip(address.to_umem() as usize)
-        .next()
-        .map(|km| ModuleInfo {
-            address,
-            size: km.size as umem,
-            base: Address::NULL,
-            name: km
-                .name
-                .split("/")
-                .last()
-                .or(Some(""))
-                .map(ReprCString::from)
-                .unwrap(),
-            arch: self.info.arch,
-            path: km.name.clone().into(),
-            parent_process: Address::INVALID,
-        })
-        .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))*/
-
-        todo!()
+    fn module_by_address(&mut self, address: Address) -> Result<ModuleInfo> {
+        Self::query_kernel_modules()?
+            .into_iter()
+            .find(|km| km.base == address)
+            .map(|km| ModuleInfo {
+                address,
+                size: km.size,
+                base: km.base,
+                name: km.name.clone(),
+                arch: self.info.arch,
+                path: km.path.clone(),
+                parent_process: Address::INVALID,
+            })
+            .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
     }
 
     /// Retrieves address of the primary module structure of the process

@@ -61,7 +61,7 @@ jobs:
           strip: false
 
       - name: Install memflowup
-        run: cargo install --git https://github.com/memflow/memflowup
+        run: cargo install --locked memflowup
       - run: echo "${{ secrets.MEMFLOW_REGISTRY_SIGNING_KEY}}" > ec-secp256k1-priv-key.pem
       - name: Upload plugin (linux)
         run: memflowup --skip-version-check push --token ${{ secrets.MEMFLOW_REGISTRY_TOKEN }} --priv-key ec-secp256k1-priv-key.pem --file target/${{ matrix.platform.target }}/release/libmemflow_${{ env.PLUGIN_NAME }}.so

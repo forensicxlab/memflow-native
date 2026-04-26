@@ -106,15 +106,17 @@ impl ProcessVirtualMemory {
         }: MemOps<CTup3<Address, Address, T>, CTup2<Address, T>>,
     ) -> Result<()> {
         for CTup3(addr, meta_addr, buf) in inp {
-            let written = unsafe {
+            let written = match unsafe {
                 T::do_rw(
                     &self.handle,
                     buf.as_ptr() as _,
                     addr.to_umem() as _,
                     buf.len(),
                 )
-            }
-            .unwrap_or(0);
+            } {
+                Ok(written) => written,
+                Err(err) => return Err(err),
+            };
 
             let (succeed, fail) = buf.split_at(written as _);
 

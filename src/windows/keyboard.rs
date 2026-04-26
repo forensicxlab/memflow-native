@@ -56,7 +56,7 @@ impl KeyboardState for WindowsKeyboardState {
     ///
     /// A list of all Keycodes can be found on the [msdn](https://docs.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes).
     fn is_down(&self, vk: i32) -> bool {
-        if (0..=256).contains(&vk) {
+        if (0..256).contains(&vk) {
             self.buffer[vk as usize] & 0x80 != 0
         } else {
             false

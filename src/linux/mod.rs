@@ -16,12 +16,20 @@ pub use process::LinuxProcess;
 
 pub struct LinuxOs {
     info: OsInfo,
-    cached_modules: Vec<KernelModule>,
 }
 
 impl LinuxOs {
     pub fn new(_: &OsArgs) -> Result<Self> {
         Ok(Default::default())
+    }
+
+    fn kernel_modules_sorted(&self) -> Result<Vec<KernelModule>> {
+        let mut modules: Vec<KernelModule> = procfs::modules()
+            .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))?
+            .into_values()
+            .collect();
+        modules.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(modules)
     }
 }
 
@@ -29,7 +37,6 @@ impl Clone for LinuxOs {
     fn clone(&self) -> Self {
         Self {
             info: self.info.clone(),
-            cached_modules: vec![],
         }
     }
 }
@@ -42,10 +49,7 @@ impl Default for LinuxOs {
             arch: ArchitectureIdent::X86(64, false),
         };
 
-        Self {
-            info,
-            cached_modules: vec![],
-        }
+        Self { info }
     }
 }
 
@@ -139,12 +143,9 @@ impl Os for LinuxOs {
     /// # Arguments
     /// * `callback` - where to pass each matching module to. This is an opaque callback.
     fn module_address_list_callback(&mut self, mut callback: AddressCallback) -> Result<()> {
-        self.cached_modules = procfs::modules()
-            .map_err(|_| Error(ErrorOrigin::OsLayer, ErrorKind::UnableToReadDir))?
-            .into_values()
-            .collect();
+        let modules = self.kernel_modules_sorted()?;
 
-        (0..self.cached_modules.len())
+        (0..modules.len())
             .map(Address::from)
             .take_while(|a| callback.call(*a))
             .for_each(|_| {});
@@ -157,7 +158,9 @@ impl Os for LinuxOs {
     /// # Arguments
     /// * `address` - address where module's information resides in
     fn module_by_address(&mut self, address: Address) -> Result<ModuleInfo> {
-        self.cached_modules
+        let modules = self.kernel_modules_sorted()?;
+
+        modules
             .get(address.to_umem() as usize)
             .map(|km| ModuleInfo {
                 address,
@@ -181,8 +184,8 @@ impl Os for LinuxOs {
     ///
     /// This will generally be for the initial executable that was run
     fn primary_module_address(&mut self) -> Result<Address> {
-        // TODO: Is it always 0th mod?
-        Ok(Address::from(0))
+        // TODO: Add Linux kernel image discovery via /proc/kallsyms and/or /sys/kernel/sections.
+        Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotSupported))
     }
 
     /// Retrieves a list of all imports of a given module
