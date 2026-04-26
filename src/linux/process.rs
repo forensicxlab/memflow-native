@@ -109,6 +109,7 @@ impl LinuxProcess {
         }
     }
 
+    #[cfg(memflow_plugin_api = "2")]
     fn collect_envars(&self) -> Result<Vec<EnvVarInfo>> {
         let path = format!("/proc/{}/environ", self.pid);
         let data = std::fs::read(path)
@@ -318,11 +319,13 @@ impl Process for LinuxProcess {
         Ok(())
     }
 
+    #[cfg(memflow_plugin_api = "2")]
     fn environment_block_address(&mut self, _architecture: ArchitectureIdent) -> Result<Address> {
         // Linux does not expose a stable public env-block pointer through procfs.
         Ok(Address::NULL)
     }
 
+    #[cfg(memflow_plugin_api = "2")]
     fn envar_list_from_address(
         &mut self,
         _env_block: Address,

@@ -32,6 +32,7 @@ pub use process::MacProcess;
 pub(super) struct ProcArgs {
     pub exec_path: String,
     pub argv: Vec<String>,
+    #[cfg(memflow_plugin_api = "2")]
     pub environ: Vec<(String, String)>,
 }
 
@@ -85,6 +86,34 @@ pub(super) fn read_procargs2(pid: Pid) -> Result<Vec<u8>> {
     Ok(scratch)
 }
 
+#[cfg(memflow_plugin_api = "2")]
+fn parse_environ(buf: &[u8]) -> Vec<(String, String)> {
+    let mut environ = Vec::new();
+    let mut idx = 0;
+
+    while idx < buf.len() {
+        let start = idx;
+        while idx < buf.len() && buf[idx] != 0 {
+            idx += 1;
+        }
+
+        if idx == start {
+            break;
+        }
+
+        let entry = String::from_utf8_lossy(&buf[start..idx]);
+        if let Some((name, value)) = entry.split_once('=') {
+            environ.push((name.to_string(), value.to_string()));
+        }
+
+        if idx < buf.len() {
+            idx += 1;
+        }
+    }
+
+    environ
+}
+
 pub(super) fn parse_procargs2(data: &[u8]) -> Result<ProcArgs> {
     if data.len() < 4 {
         return Err(Error(ErrorOrigin::OsLayer, ErrorKind::Unknown));
@@ -126,33 +155,11 @@ pub(super) fn parse_procargs2(data: &[u8]) -> Result<ProcArgs> {
         }
     }
 
-    // Parse the trailing NUL-separated `KEY=VALUE` block.
-    // Some macOS processes only expose argc/argv here (no env entries), which is a valid outcome.
-    let mut environ = Vec::new();
-    while idx < buf.len() {
-        let start = idx;
-        while idx < buf.len() && buf[idx] != 0 {
-            idx += 1;
-        }
-
-        if idx == start {
-            break;
-        }
-
-        let entry = String::from_utf8_lossy(&buf[start..idx]);
-        if let Some((name, value)) = entry.split_once('=') {
-            environ.push((name.to_string(), value.to_string()));
-        }
-
-        if idx < buf.len() {
-            idx += 1;
-        }
-    }
-
     Ok(ProcArgs {
         exec_path,
         argv,
-        environ,
+        #[cfg(memflow_plugin_api = "2")]
+        environ: parse_environ(&buf[idx..]),
     })
 }
 

@@ -45,6 +45,7 @@ impl WindowsProcess {
         })
     }
 
+    #[cfg(memflow_plugin_api = "2")]
     fn collect_envars(&mut self) -> Result<Vec<EnvVarInfo>> {
         // Step 1: get PEB base via NtQueryInformationProcess
         let mut pbi = PROCESS_BASIC_INFORMATION::default();
@@ -72,9 +73,8 @@ impl WindowsProcess {
                 ptr::null_mut(),
             )
         };
-        let is_32bit = wow64_status.is_ok()
-            && wow64_status != STATUS_INVALID_INFO_CLASS
-            && wow64_peb != 0;
+        let is_32bit =
+            wow64_status.is_ok() && wow64_status != STATUS_INVALID_INFO_CLASS && wow64_peb != 0;
 
         // Step 3: read ProcessParameters pointer from PEB
         // PEB64 ProcessParameters at +0x20, PEB32 at +0x10
@@ -361,7 +361,6 @@ impl Process for WindowsProcess {
         memflow::os::util::module_section_list_callback(&mut self.virt_mem, info, callback)
     }
 
-    
     #[cfg(memflow_plugin_api = "2")]
     fn envar_list_callback(
         &mut self,
@@ -383,10 +382,12 @@ impl Process for WindowsProcess {
         Ok(())
     }
 
+    #[cfg(memflow_plugin_api = "2")]
     fn environment_block_address(&mut self, _architecture: ArchitectureIdent) -> Result<Address> {
         Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotSupported))
     }
 
+    #[cfg(memflow_plugin_api = "2")]
     fn envar_list_from_address(
         &mut self,
         _env_block: Address,
